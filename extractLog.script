@@ -1,0 +1,104 @@
+REFERENCE @"System.Core.dll";
+
+#DECLARE StartDate string = "@@StartDate@@";
+#DECLARE EndDate string = "@@EndDate@@";
+
+xSLAPI =
+    VIEW @"/shares/searchDM/distrib/released/xSLAPI/xSLAPI.view"
+    PARAMS
+    (
+        Start = @StartDate,
+        End = @EndDate,
+        Dataset = "Bing.com,Mobile",
+        Traffic = "Normal",
+        QueryType = "Web"
+    );
+
+QueryUrl =
+    SELECT Query_RawQuery AS Query, Market,
+           WebElement.URL AS URL, WebElement.Rank AS Rank, WebElement.Clicks.Count AS ClickCount, WebElement.Title AS Title, WebElement.Snippet AS Snippet, Request_ImpressionGuid AS ImpressionGuid, Request_RequestTime AS RequestTime
+    FROM xSLAPI
+    CROSS APPLY WebExs AS WebElement
+    WHERE 
+        Market.StartsWith("en")
+        AND Vertical == "web"
+        AND NOT Request_IsBotVNext
+        AND NOT User_HasMsIp
+        AND Query_IsNormal
+//        AND Page_HasClickTracking
+        AND Page_PageNumber == 1
+        AND NOT String.IsNullOrWhiteSpace(Query_RawQuery) 
+        AND NOT Helper.IsQueryBad(Query_RawQuery, 246)
+        AND NOT Request_IsMarketingTraffic 
+        AND NOT Reporting_IsEditorial
+        AND Page_Name.ToLower().Trim() == "page.serp";
+
+QueryImpression = 
+    SELECT Query, Market, COUNT(DISTINCT ImpressionGuid) AS QueryImpression
+    FROM QueryUrl;
+
+RecentLog = 
+    SELECT Query, Market, MAX(RequestTime) AS RequestTime
+    FROM QueryUrl;
+
+DetailedRecentLog =
+SELECT QueryUrl.* FROM QueryUrl INNER JOIN RecentLog ON QueryUrl.Query==RecentLog.Query AND QueryUrl.Market==RecentLog.Market AND QueryUrl.RequestTime==RecentLog.RequestTime; 
+
+QueryUrlImpression = 
+    SELECT Query, Market, URL, AVG(Rank) AS AvgRank, MIN(Rank) AS MinRank, SUM(ClickCount) AS Clicks, COUNT(DISTINCT ImpressionGuid) AS QueryUrlImpression
+    FROM QueryUrl
+    GROUP BY Query, Market, URL;
+
+QueryUrlImpression = 
+SELECT QueryUrlImpression.*, DetailedRecentLog.Rank AS RecentRank, DetailedRecentLog.ClickCount AS RecentClickCount, DetailedRecentLog.Title AS Title, DetailedRecentLog.Snippet AS Snippet
+FROM QueryUrlImpression INNER JOIN DetailedRecentLog
+ON QueryUrlImpression.Query==DetailedRecentLog.Query AND QueryUrlImpression.Market==DetailedRecentLog.Market AND QueryUrlImpression.URL==DetailedRecentLog.URL; 
+
+Result1=
+    SELECT QueryUrlImpression.*, QueryImpression, (double)QueryUrlImpression/QueryImpression AS UrlImpRate
+    FROM QueryUrlImpression 
+    LEFT OUTER JOIN QueryImpression
+    ON QueryUrlImpression.Query==QueryImpression.Query AND QueryUrlImpression.Market==QueryImpression.Market;
+
+OUTPUT Result1 TO SSTREAM @@Out1@@
+CLUSTERED BY Query SORTED BY Query;
+
+#CS
+public class Helper
+{
+    public static bool IsQueryBad(string query, uint maxBytes)
+    {
+        //maxBytes = 246
+        if (String.IsNullOrEmpty(query) == true)
+        { // Empty Phrase
+            return true;
+        }
+        if (query.EndsWith(";") == true)
+        { // Trailing Semicolon
+            return true;
+        }
+        if (query.Contains(":"))
+        { // internal queries
+            return true;
+        }
+        if (query.IndexOf("word:(") >= 0)
+        { // word: operator
+            return true;
+        }
+        string[] terms = query.Split(' '); // Long Terms
+        uint length;
+        foreach (string term in terms)
+        {
+            length = (uint)(System.Text.Encoding.UTF8.GetByteCount(term));
+            if (length > maxBytes)
+                return true;
+        }
+        if (query.Contains("\0"))
+        { // null bytes : 22 Aug 2010
+            return true;
+        }
+
+        return false;
+    }
+}
+#ENDCS
